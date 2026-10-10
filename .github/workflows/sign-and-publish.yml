@@ -1,0 +1,93 @@
+name: Sign and publish stable update
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag (for example v0.2.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clicksales-update-release
+  cancel-in-progress: false
+
+jobs:
+  sign-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate, sign, attach, and publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          CLICKSALES_UPDATE_PRIVATE_KEY: ${{ secrets.CLICKS_UPDATE_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})$ ]]
+          test -n "$CLICKSALES_UPDATE_PRIVATE_KEY"
+          release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,assets)"
+          RELEASE_JSON="$release_json" node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          const release = JSON.parse(process.env.RELEASE_JSON);
+          assert.equal(release.tagName, process.env.RELEASE_TAG, 'Release tag does not match input');
+          assert.equal(release.isDraft, true, 'Only draft releases can be signed');
+          assert.equal(release.isPrerelease, false, 'Prereleases are not accepted');
+          const names = new Set(release.assets.map((asset) => asset.name));
+          assert(names.has('ClickSales-Setup.exe'), 'Draft must contain ClickSales-Setup.exe');
+          assert(names.has('latest.yml'), 'Draft must contain electron-builder latest.yml');
+          NODE
+
+          release_dir="$RUNNER_TEMP/clicksales-update-release"
+          mkdir -m 700 "$release_dir"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$release_dir" \
+            --pattern 'ClickSales-Setup.exe' --pattern 'latest.yml'
+
+          RELEASE_DIR="$release_dir" node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash, createPrivateKey, createPublicKey, sign } from 'node:crypto';
+          import { readFile, stat, writeFile } from 'node:fs/promises';
+          import path from 'node:path';
+
+          const dir = process.env.RELEASE_DIR;
+          const tag = process.env.RELEASE_TAG;
+          const version = tag.slice(1);
+          const maxSize = 1_500_000_000;
+          const installerPath = path.join(dir, 'ClickSales-Setup.exe');
+          const installerStat = await stat(installerPath);
+          assert(installerStat.isFile() && installerStat.size > 0 && installerStat.size <= maxSize, 'Installer size is invalid');
+          const installer = await readFile(installerPath);
+          const sha512 = createHash('sha512').update(installer).digest('base64');
+          const latest = await readFile(path.join(dir, 'latest.yml'), 'utf8');
+          assert(new RegExp(`^version: ${version.replaceAll('.', '\\.')}\\s*$`, 'm').test(latest), 'latest.yml version does not match tag');
+          assert(/^path: ClickSales-Setup\.exe\s*$/m.test(latest), 'latest.yml must point to the expected NSIS installer');
+          assert(new RegExp(`^sha512: ${sha512.replace(/[+/=]/g, '\\$&')}\\s*$`, 'm').test(latest), 'latest.yml SHA-512 does not match installer');
+
+          const privateKey = createPrivateKey(process.env.CLICKSALES_UPDATE_PRIVATE_KEY.replaceAll('\\n', '\n'));
+          assert.equal(privateKey.asymmetricKeyType, 'ed25519', 'Update key must be Ed25519');
+          const expectedPublicKey = 'MCowBQYDK2VwAyEApl5C+cTLwEIpmxV8GCCnHuIu14JqowoOpIgVNWm9xjU=';
+          const actualPublicKey = createPublicKey(privateKey).export({ format: 'der', type: 'spki' }).toString('base64');
+          assert.equal(actualPublicKey, expectedPublicKey, 'Signing key does not match the ClickSales updater trust key');
+
+          const manifest = {
+            product: 'ClickSales',
+            tag,
+            version,
+            artifactName: 'ClickSales-Setup.exe',
+            sha512,
+            size: installerStat.size,
+          };
+          const raw = JSON.stringify(manifest);
+          const detachedSignature = sign(null, Buffer.from(raw, 'utf8'), privateKey).toString('base64');
+          await writeFile(path.join(dir, 'update-manifest.json'), raw, { mode: 0o600, flag: 'wx' });
+          await writeFile(path.join(dir, 'update-manifest.sig'), `${detachedSignature}\n`, { mode: 0o600, flag: 'wx' });
+          console.log(`Validated and signed ClickSales ${version}; installer size ${installerStat.size} bytes.`);
+          NODE
+
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$release_dir/update-manifest.json" "$release_dir/update-manifest.sig"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
